@@ -1,4 +1,3 @@
-
 """Request and response shapes for the payments API."""
 
 from datetime import datetime
