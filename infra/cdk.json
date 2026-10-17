@@ -1,0 +1,13 @@
+{
+  "app": "python3 app.py",
+  "watch": {
+    "include": ["**"],
+    "exclude": ["README.md", "cdk*.json", "requirements*.txt", "**/__pycache__", "tests"]
+  },
+  "context": {
+    "githubRepo": "essiewakukha/Pesaguard-self-healing-platform",
+    "@aws-cdk/aws-iam:minimizePolicies": true,
+    "@aws-cdk/core:target-partitions": ["aws"],
+    "@aws-cdk/core:defaultCrossStackReferences": "strong"
+  }
+}
