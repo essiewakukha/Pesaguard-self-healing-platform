@@ -1,0 +1,31 @@
+# Local development: the API plus DynamoDB Local. No AWS account needed.
+#   docker compose up --build
+#   curl http://localhost:8080/health
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:latest
+    command: ["-jar", "DynamoDBLocal.jar", "-inMemory", "-sharedDb"]
+    ports:
+      - "8001:8000"
+
+  api:
+    build:
+      context: ./app
+      args:
+        APP_VERSION: ${APP_VERSION:-v1.0.0-local}
+        FAULT_MODE: ${FAULT_MODE:-none}
+    ports:
+      - "8080:8000"
+    environment:
+      DEPLOY_COLOR: local
+      TABLE_NAME: pesaguard-payments
+      AWS_REGION: us-east-1
+      DYNAMODB_ENDPOINT: http://dynamodb:8000
+      AUTO_CREATE_TABLE: "true"
+      # DynamoDB Local accepts any credentials; these are not real keys.
+      AWS_ACCESS_KEY_ID: local
+      AWS_SECRET_ACCESS_KEY: local
+    depends_on:
+      - dynamodb
+    # DynamoDB Local can take a few seconds to start; retry until it is up.
+    restart: on-failure
