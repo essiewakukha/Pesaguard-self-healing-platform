@@ -1,0 +1,9 @@
+tests/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+__pycache__/
+*.pyc
+.venv/
+requirements-dev.txt

@@ -1,0 +1,27 @@
+[project]
+name = "pesaguard"
+version = "0.1.0"
+description = "Self-healing payments API"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q --cov=pesaguard --cov-report=term-missing --cov-fail-under=80"
+
+[tool.coverage.run]
+branch = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "SIM"]
+ignore = [
+    "B008",  # FastAPI uses Depends() in default arguments by design
+    "S311",  # random is fine for fault injection, it is not security-related
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]  # assert is how pytest works
