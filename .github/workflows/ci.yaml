@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: app/requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Lint
+        run: ruff check . && ruff format --check .
+      - name: Unit tests (fails under 80% coverage)
+        run: pytest
+
+  build-scan-smoke:
+    name: Build, scan and smoke test
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build --build-arg APP_VERSION=ci-${{ github.sha }} -t pesaguard:ci app
+
+      # SECURITY: most older trivy-action tags were hijacked in March 2026
+      # (CVE-2026-33634). Use v0.35.0 or newer, and ideally pin to the release's
+      # full commit SHA (copy it from the action's GitHub releases page).
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          image-ref: pesaguard:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Smoke test with docker compose
+        run: |
+          docker compose up -d --build
+          for i in $(seq 1 30); do
+            if curl -fs http://localhost:8080/ready >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -fs http://localhost:8080/ready
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/payments \
+            -H 'Content-Type: application/json' -H 'Idempotency-Key: ci-smoke-0001' \
+            -d '{"amount":100,"phone_number":"254712345678","reference":"CI"}')
+          test "$code" = "201" || { echo "expected 201, got $code"; docker compose logs; exit 1; }
+          echo "Smoke test passed"
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

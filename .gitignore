@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# CDK (Phase 3)
+cdk.out/
+infra/.venv/
+
+# Secrets: never commit these
+.env
+*.pem
+*.key
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

@@ -1,35 +1,47 @@
-"""Settings read from environment variables.
 
-Everything that changes between laptop, CI and AWS lives here, so the code
-itself never needs editing to run somewhere else.
-"""
+"""Request and response shapes for the payments API."""
 
-import os
-from dataclasses import dataclass, field
+from datetime import datetime
+from enum import StrEnum
+from typing import Literal
 
-
-@dataclass(frozen=True)
-class Settings:
-    app_version: str = field(default_factory=lambda: os.getenv("APP_VERSION", "v0.0.0-dev"))
-    # Which colour this copy of the app is running as (blue or green). Shown in
-    # /health so you can see which side of a deployment answered a request.
-    deploy_color: str = field(default_factory=lambda: os.getenv("DEPLOY_COLOR", "local"))
-    fault_mode: str = field(default_factory=lambda: os.getenv("FAULT_MODE", "none"))
-
-    table_name: str = field(default_factory=lambda: os.getenv("TABLE_NAME", "pesaguard-payments"))
-    aws_region: str = field(default_factory=lambda: os.getenv("AWS_REGION", "us-east-1"))
-    # Set only for local development (DynamoDB Local). Leave empty on AWS.
-    dynamodb_endpoint: str | None = field(
-        default_factory=lambda: os.getenv("DYNAMODB_ENDPOINT") or None
-    )
-    # Local development only: create the table on startup if it is missing.
-    # On AWS the table is created by CDK, never by the app.
-    auto_create_table: bool = field(
-        default_factory=lambda: os.getenv("AUTO_CREATE_TABLE", "false").lower() == "true"
-    )
-
-    max_amount: int = field(default_factory=lambda: int(os.getenv("MAX_AMOUNT", "150000")))
+from pydantic import BaseModel, Field
 
 
-def get_settings() -> Settings:
-    return Settings()
+class PaymentStatus(StrEnum):
+    COMPLETED = "completed"
+
+
+class PaymentRequest(BaseModel):
+    # Whole shillings only. Mobile money works in whole units, and integers
+    # avoid floating-point rounding errors with money.
+    amount: int = Field(gt=0, description="Amount in whole Kenyan shillings")
+    currency: Literal["KES"] = "KES"
+    # Kenyan mobile number in international format, e.g. 254712345678.
+    phone_number: str = Field(pattern=r"^254(7|1)\d{8}$")
+    reference: str = Field(min_length=1, max_length=64, description="Merchant's own reference")
+
+
+class Payment(BaseModel):
+    payment_id: str
+    amount: int
+    currency: str
+    phone_number: str
+    reference: str
+    status: PaymentStatus
+    created_at: datetime
+    # The version that processed the payment. Very useful during a canary:
+    # you can see exactly which release handled a failed request.
+    processed_by_version: str
+
+
+class HealthResponse(BaseModel):
+    status: Literal["ok"]
+    version: str
+    color: str
+
+
+class ReadyResponse(BaseModel):
+    status: Literal["ready", "not_ready"]
+    version: str
+    checks: dict[str, str]
