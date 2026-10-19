@@ -1,12 +1,15 @@
 """The running service: ECS Fargate tasks behind an Application Load Balancer.
 
-Traffic path:  internet -> ALB (port 80) -> listener rule -> blue target group -> tasks
+Traffic path:  internet -> ALB (port 80) -> production rule -> live target group -> tasks
 
-Deployments use ECS native blue/green: ECS starts the new version (green) in
-the second target group, checks it is healthy, flips the listener rule to it,
-keeps the old version (blue) around for the bake time, then removes blue.
-If green fails, traffic never leaves blue. Phase 5 adds CloudWatch alarms and a
-release-gate Lambda that can also trigger rollback during the bake time.
+A release (ECS native CANARY deployment) goes like this:
+  1. ECS starts the new version (green) in the other target group.
+  2. Test traffic: the test listener (port 9000) points at green. ECS calls the
+     release-gate Lambda, which sends real payments to green. Fail -> rollback.
+  3. Canary: 20% of production traffic moves to green for 2 minutes.
+  4. 100% moves to green; the old version (blue) stays up for the bake time.
+  During 3 and 4, any error-rate or latency alarm rolls the release back.
+See release_safety.py for the alarms and the gate.
 """
 
 import aws_cdk as cdk
@@ -19,9 +22,12 @@ from aws_cdk import aws_logs as logs
 from constructs import Construct
 
 from .nag import acknowledge
+from .release_safety import ReleaseAlarms, ReleaseGate
 
 CONTAINER_NAME = "api"
 CONTAINER_PORT = 8000
+TEST_PORT = 9000
+TEST_HEADER = "x-pesaguard-test"
 
 
 class ServiceStack(cdk.Stack):
@@ -43,6 +49,12 @@ class ServiceStack(cdk.Stack):
             self, "AlbSg", vpc=vpc, description="PesaGuard load balancer", allow_all_outbound=False
         )
         alb_sg.add_ingress_rule(ec2.Peer.any_ipv4(), ec2.Port.tcp(80), "HTTP from internet")
+        # Test listener for the release gate. The gate Lambda runs outside the
+        # VPC, so the port is reachable from the internet, but the listener only
+        # forwards requests carrying the test header; everything else gets 404.
+        alb_sg.add_ingress_rule(
+            ec2.Peer.any_ipv4(), ec2.Port.tcp(TEST_PORT), "Release gate test traffic"
+        )
 
         task_sg = ec2.SecurityGroup(
             self,
@@ -117,6 +129,47 @@ class ServiceStack(cdk.Stack):
             ),
         )
 
+        # Test traffic: same two target groups. ECS points this rule at green
+        # while the release gate runs.
+        test_token = self.node.try_get_context("testToken") or f"pg-{self.node.addr[:20]}"
+        test_listener = alb.add_listener(
+            "Test",
+            port=TEST_PORT,
+            protocol=elbv2.ApplicationProtocol.HTTP,
+            open=False,
+            default_action=elbv2.ListenerAction.fixed_response(
+                404, content_type="application/json", message_body='{"detail":"not found"}'
+            ),
+        )
+        test_rule = elbv2.ApplicationListenerRule(
+            self,
+            "TestRule",
+            listener=test_listener,
+            priority=10,
+            conditions=[elbv2.ListenerCondition.http_header(TEST_HEADER, [test_token])],
+            action=elbv2.ListenerAction.weighted_forward(
+                [
+                    elbv2.WeightedTargetGroup(target_group=blue_tg, weight=100),
+                    elbv2.WeightedTargetGroup(target_group=green_tg, weight=0),
+                ]
+            ),
+        )
+
+        # ---- release safety: rollback alarms + release gate -------------------
+        alarms = ReleaseAlarms(
+            self,
+            "ReleaseAlarms",
+            target_groups={"blue": blue_tg, "green": green_tg},
+            alarm_email=self.node.try_get_context("alarmEmail"),
+        )
+        gate = ReleaseGate(
+            self,
+            "ReleaseGate",
+            test_url=f"http://{alb.load_balancer_dns_name}:{TEST_PORT}",
+            test_header=TEST_HEADER,
+            test_token=test_token,
+        )
+
         # ---- ECS cluster, task definition, container --------------------------
         cluster = ecs.Cluster(self, "Cluster", vpc=vpc, cluster_name="pesaguard")
 
@@ -168,7 +221,7 @@ class ServiceStack(cdk.Stack):
             ),
         )
 
-        # ---- the service, with ECS native blue/green ---------------------------
+        # ---- the service, with an ECS native canary deployment ----------------
         service = ecs.FargateService(
             self,
             "Service",
@@ -182,11 +235,29 @@ class ServiceStack(cdk.Stack):
             min_healthy_percent=100,
             max_healthy_percent=200,
             health_check_grace_period=cdk.Duration.seconds(30),
-            deployment_strategy=ecs.DeploymentStrategy.BLUE_GREEN,
-            # How long blue stays alive after traffic moves to green, so a
-            # rollback is instant. Phase 5 watches alarms during this window.
+            deployment_strategy=ecs.DeploymentStrategy.CANARY,
+            # 20% of production traffic to green for 2 minutes before the rest.
+            canary_configuration=ecs.TrafficShiftConfig(
+                step_percent=20, step_bake_time=cdk.Duration.minutes(2)
+            ),
+            # After 100% moves, blue stays alive this long so rollback is instant.
             bake_time=cdk.Duration.minutes(3),
+            # Tasks that will not start -> roll back.
             circuit_breaker=ecs.DeploymentCircuitBreaker(enable=True, rollback=True),
+            # Any alarm firing during the deployment -> roll back.
+            deployment_alarms=ecs.DeploymentAlarmConfig(
+                alarm_names=alarms.alarm_names,
+                behavior=ecs.AlarmBehavior.ROLLBACK_ON_ALARM,
+            ),
+        )
+
+        # Release gate: runs once green has test traffic, before any customer.
+        service.add_lifecycle_hook(
+            ecs.DeploymentLifecycleLambdaTarget(
+                gate.function,
+                "ReleaseGateHook",
+                lifecycle_stages=[ecs.DeploymentLifecycleStage.POST_TEST_TRAFFIC_SHIFT],
+            )
         )
 
         target = service.load_balancer_target(
@@ -198,6 +269,7 @@ class ServiceStack(cdk.Stack):
                 production_listener=ecs.ListenerRuleConfiguration.application_listener_rule(
                     production_rule
                 ),
+                test_listener=ecs.ListenerRuleConfiguration.application_listener_rule(test_rule),
             ),
         )
         target.attach_to_application_target_group(blue_tg)
@@ -205,6 +277,7 @@ class ServiceStack(cdk.Stack):
         # ---- outputs -------------------------------------------------------------
         cdk.CfnOutput(self, "ApiUrl", value=f"http://{alb.load_balancer_dns_name}")
         cdk.CfnOutput(self, "ImageTag", value=image_tag)
+        cdk.CfnOutput(self, "AlarmTopicArn", value=alarms.topic.topic_arn)
         cdk.CfnOutput(self, "ClusterName", value=cluster.cluster_name)
         cdk.CfnOutput(self, "ServiceName", value=service.service_name)
 
@@ -215,12 +288,15 @@ class ServiceStack(cdk.Stack):
                 "AwsSolutions-ELB2": "ALB access logs need an S3 bucket and cost money; "
                 "the app already writes one JSON log line per request to CloudWatch.",
                 "AwsSolutions-EC23": "Public HTTP API: port 80 must be open to the internet. "
-                "HTTPS needs a domain + ACM certificate (listed as a stretch goal).",
+                "Port 9000 is the release-gate test listener; it only forwards requests "
+                "carrying the test header. HTTPS needs a domain (listed as a stretch goal).",
                 "AwsSolutions-ECS4": "Container Insights costs extra; considered in Phase 4.",
                 "AwsSolutions-ECS2": "The environment variables are plain configuration "
                 "(version, table name, region). No secrets are passed this way.",
                 "AwsSolutions-IAM5[Resource::*]": "Execution role: ecr:GetAuthorizationToken "
                 "only supports resource '*'.",
+                "AwsSolutions-IAM5[Resource::<ReleaseGateFunctionF783230A.Arn>:*]": "Lets ECS "
+                "invoke any version of the release-gate function, and nothing else.",
                 "AwsSolutions-IAM4[Policy::arn:<AWS::Partition>:iam::aws:policy/"
                 "AmazonECSInfrastructureRolePolicyForLoadBalancers]": "AWS-managed policy "
                 "that ECS blue/green needs to switch the load balancer between target groups.",
