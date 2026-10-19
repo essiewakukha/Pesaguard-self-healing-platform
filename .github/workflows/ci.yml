@@ -31,6 +31,12 @@ jobs:
         run: ruff check . && ruff format --check .
       - name: Unit tests (fails under 80% coverage)
         run: pytest
+      - name: Release gate tests
+        working-directory: release_gate
+        run: ruff check . && ruff format --check . && pytest
+      - name: Release watcher tests
+        working-directory: scripts
+        run: ruff check . && ruff format --check . && pytest
 
   infra:
     name: Infrastructure tests and security checks
