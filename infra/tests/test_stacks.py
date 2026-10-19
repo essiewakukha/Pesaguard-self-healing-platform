@@ -134,7 +134,7 @@ def test_invalid_repo_rejected():
 
 
 # ---- service ------------------------------------------------------------------
-def test_service_uses_native_blue_green_with_rollback(stacks):
+def test_service_uses_canary_with_rollback(stacks):
     stacks["service"].has_resource_properties(
         "AWS::ECS::Service",
         {
@@ -142,7 +142,8 @@ def test_service_uses_native_blue_green_with_rollback(stacks):
             "LaunchType": "FARGATE",
             "DeploymentConfiguration": Match.object_like(
                 {
-                    "Strategy": "BLUE_GREEN",
+                    "Strategy": "CANARY",
+                    "CanaryConfiguration": {"CanaryPercent": 20, "CanaryBakeTimeInMinutes": 2},
                     "BakeTimeInMinutes": 3,
                     "DeploymentCircuitBreaker": {"Enable": True, "Rollback": True},
                     "MinimumHealthyPercent": 100,
@@ -154,7 +155,10 @@ def test_service_uses_native_blue_green_with_rollback(stacks):
                         "ContainerName": "api",
                         "ContainerPort": 8000,
                         "AdvancedConfiguration": Match.object_like(
-                            {"AlternateTargetGroupArn": Match.any_value()}
+                            {
+                                "AlternateTargetGroupArn": Match.any_value(),
+                                "TestListenerRule": Match.any_value(),
+                            }
                         ),
                     }
                 )
@@ -163,11 +167,64 @@ def test_service_uses_native_blue_green_with_rollback(stacks):
     )
 
 
-def test_production_rule_sends_all_traffic_to_blue_initially(stacks):
+def test_alarms_roll_back_a_deployment(stacks):
+    svc = stacks["service"].find_resources("AWS::ECS::Service")
+    (props,) = (v["Properties"] for v in svc.values())
+    alarms = props["DeploymentConfiguration"]["Alarms"]
+    assert alarms["Enable"] is True
+    assert alarms["Rollback"] is True
+    assert len(alarms["AlarmNames"]) == 4  # error rate + p99 latency, for each target group
+
+
+def test_alarm_thresholds(stacks):
+    stacks["service"].resource_count_is("AWS::CloudWatch::Alarm", 4)
+    for colour in ("blue", "green"):
+        stacks["service"].has_resource_properties(
+            "AWS::CloudWatch::Alarm",
+            {"AlarmName": f"pesaguard-{colour}-error-rate", "Threshold": 5},
+        )
+        stacks["service"].has_resource_properties(
+            "AWS::CloudWatch::Alarm",
+            {
+                "AlarmName": f"pesaguard-{colour}-latency-p99",
+                "Threshold": 1,
+                "ExtendedStatistic": "p99",
+            },
+        )
+
+
+def test_release_gate_runs_before_production_traffic(stacks):
+    svc = stacks["service"].find_resources("AWS::ECS::Service")
+    (props,) = (v["Properties"] for v in svc.values())
+    (hook,) = props["DeploymentConfiguration"]["LifecycleHooks"]
+    assert hook["LifecycleStages"] == ["POST_TEST_TRAFFIC_SHIFT"]
+    stacks["service"].has_resource_properties(
+        "AWS::Lambda::Function",
+        {
+            "Handler": "handler.handler",
+            "Environment": {
+                "Variables": Match.object_like(
+                    {"TEST_HEADER": "x-pesaguard-test", "GATE_CHECKS": "20"}
+                )
+            },
+        },
+    )
+
+
+def test_test_listener_requires_secret_header(stacks):
+    rules = stacks["service"].find_resources(
+        "AWS::ElasticLoadBalancingV2::ListenerRule",
+        {"Properties": {"Conditions": [Match.object_like({"Field": "http-header"})]}},
+    )
+    assert len(rules) == 1
+
+
+def test_rules_send_all_traffic_to_blue_initially(stacks):
     rules = stacks["service"].find_resources("AWS::ElasticLoadBalancingV2::ListenerRule")
-    (rule,) = rules.values()
-    groups = rule["Properties"]["Actions"][0]["ForwardConfig"]["TargetGroups"]
-    assert sorted(g["Weight"] for g in groups) == [0, 100]
+    assert len(rules) == 2  # production + test
+    for rule in rules.values():
+        groups = rule["Properties"]["Actions"][0]["ForwardConfig"]["TargetGroups"]
+        assert sorted(g["Weight"] for g in groups) == [0, 100]
 
 
 def test_target_groups_check_readiness(stacks):
@@ -187,7 +244,7 @@ def test_tasks_only_reachable_from_load_balancer(stacks):
     for sg in stacks["service"].find_resources("AWS::EC2::SecurityGroup").values():
         for rule in sg["Properties"].get("SecurityGroupIngress", []):
             if rule.get("CidrIp") == "0.0.0.0/0":
-                assert rule["FromPort"] == 80, "only the ALB port may be open to the internet"
+                assert rule["FromPort"] in (80, 9000), "only ALB listener ports may be public"
 
 
 def test_container_is_small_and_hardened(stacks):

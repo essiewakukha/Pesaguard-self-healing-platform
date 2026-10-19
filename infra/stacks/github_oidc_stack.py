@@ -70,8 +70,19 @@ class GithubOidcStack(cdk.Stack):
             ),
         )
 
-        # Push images to our one repository only.
+        # Push images to our one repository only, and check whether a tag exists.
         repository.grant_pull_push(self.deploy_role)
+        repository.grant(self.deploy_role, "ecr:DescribeImages")
+
+        # Read the service stack's outputs (the API address) for the job summary.
+        self.deploy_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["cloudformation:DescribeStacks"],
+                resources=[
+                    f"arn:aws:cloudformation:{self.region}:{self.account}:stack/PesaGuardService/*"
+                ],
+            )
+        )
 
         # Let the pipeline run `cdk deploy` by assuming the roles that
         # `cdk bootstrap` created. Those roles do the actual deployment, so
@@ -93,6 +104,9 @@ class GithubOidcStack(cdk.Stack):
                 "AwsSolutions-IAM5[Resource::arn:aws:iam::<AWS::AccountId>:role/"
                 "cdk-hnb659fds-*-role-<AWS::AccountId>-*]": "Limited to the roles created "
                 "by `cdk bootstrap` in this account; they perform the actual deployment.",
+                "AwsSolutions-IAM5[Resource::arn:aws:cloudformation:<AWS::Region>:"
+                "<AWS::AccountId>:stack/PesaGuardService/*]": "Read-only DescribeStacks on the "
+                "one service stack; the suffix after the stack name is a generated ID.",
             },
         )
 
