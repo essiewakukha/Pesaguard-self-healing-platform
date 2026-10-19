@@ -74,9 +74,9 @@ Alarm history for the slow release (`make alarm-history`):
 
 ¹ During the 20% canary, up to a fifth of requests reached the slow version before the alarm fired. The exact count comes from the release watcher CSV in `screenshots/`.
 
-<!-- Add these files to screenshots/ and they will show here -->
+
 ![ECS deployments showing both automatic rollbacks](screenshots/ecs-deployments.png)
-![p99 latency alarm crossing the 1 s threshold](screenshots/alarm-latency.png)
+![p99 latency alarm crossing the 1 s threshold](screenshots/latency-alarm.png)
 
 ---
 
