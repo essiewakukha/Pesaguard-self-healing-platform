@@ -1,0 +1,95 @@
+name: Deploy
+
+# Two ways to release:
+#   1. Push a version tag:        git tag v1.2.0 && git push origin v1.2.0
+#   2. Run it by hand (Actions tab -> Deploy -> Run workflow), optionally
+#      building a deliberately bad release to prove automatic rollback.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to build and deploy (must be new; tags are immutable)"
+        required: true
+      fault_mode:
+        description: "Build a deliberately bad release?"
+        type: choice
+        default: none
+        options:
+          - none
+          - error_rate=0.3
+          - latency_ms=1500
+
+permissions:
+  id-token: write   # lets GitHub issue the OIDC token AWS trusts
+  contents: read
+
+# Never run two releases at once.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  TAG: ${{ inputs.tag || github.ref_name }}
+  FAULT_MODE: ${{ inputs.fault_mode || 'none' }}
+
+jobs:
+  deploy:
+    name: Build, push and canary release
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sign in to AWS with OIDC (no stored keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image ${{ env.TAG }}
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/pesaguard
+        run: |
+          if aws ecr describe-images --repository-name pesaguard --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+            echo "Image $TAG already exists; tags are immutable, so reusing it."
+          else
+            docker build --build-arg APP_VERSION="$TAG" --build-arg FAULT_MODE="$FAULT_MODE" -t "$IMAGE:$TAG" app
+            docker push "$IMAGE:$TAG"
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: infra/requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install CDK
+        run: |
+          pip install -r infra/requirements.txt
+          npm install -g aws-cdk
+
+      # CloudFormation waits for the ECS deployment to finish. If the release
+      # gate fails or an alarm fires, ECS rolls back, CloudFormation reports
+      # the failure, and this job goes red: the pipeline tells the truth.
+      - name: Canary release ${{ env.TAG }} (fault mode ${{ env.FAULT_MODE }})
+        working-directory: infra
+        run: cdk deploy PesaGuardService --exclusively --require-approval never -c imageTag="$TAG"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Release $TAG"
+            echo "- Fault mode: \`$FAULT_MODE\`"
+            echo "- Result: **${{ job.status }}**"
+            echo "- Live version now: \`$(curl -s --max-time 5 "$(aws cloudformation describe-stacks --stack-name PesaGuardService --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue" --output text)/health" || echo unknown)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
